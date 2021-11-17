@@ -1,0 +1,751 @@
+Index: sys/kern/init_sysent.c
+===================================================================
+RCS file: /cvs/src/sys/kern/init_sysent.c,v
+retrieving revision 1.229
+diff -u -p -r1.229 init_sysent.c
+--- sys/kern/init_sysent.c	4 Jun 2021 09:06:09 -0000	1.229
++++ sys/kern/init_sysent.c	23 Oct 2021 17:11:33 -0000
+@@ -1,4 +1,4 @@
+-/*	$OpenBSD: init_sysent.c,v 1.229 2021/06/04 09:06:09 mvs Exp $	*/
++/*	$OpenBSD$	*/
+ 
+ /*
+  * System call switch table.
+@@ -751,5 +751,9 @@ struct sysent sysent[] = {
+ 	    sys___set_tcb },			/* 329 = __set_tcb */
+ 	{ 0, 0, SY_NOLOCK | 0,
+ 	    sys___get_tcb },			/* 330 = __get_tcb */
++	{ 5, s(struct sys_recvmmsg_args), SY_NOLOCK | 0,
++	    sys_recvmmsg },			/* 331 = recvmmsg */
++	{ 4, s(struct sys_sendmmsg_args), SY_NOLOCK | 0,
++	    sys_sendmmsg },			/* 332 = sendmmsg */
+ };
+ 
+Index: sys/kern/syscalls.c
+===================================================================
+RCS file: /cvs/src/sys/kern/syscalls.c,v
+retrieving revision 1.228
+diff -u -p -r1.228 syscalls.c
+--- sys/kern/syscalls.c	4 Jun 2021 09:06:09 -0000	1.228
++++ sys/kern/syscalls.c	23 Oct 2021 17:11:33 -0000
+@@ -1,4 +1,4 @@
+-/*	$OpenBSD: syscalls.c,v 1.228 2021/06/04 09:06:09 mvs Exp $	*/
++/*	$OpenBSD$	*/
+ 
+ /*
+  * System call names.
+@@ -393,4 +393,6 @@ char *syscallnames[] = {
+ 	"#328 (obsolete __tfork51)",		/* 328 = obsolete __tfork51 */
+ 	"__set_tcb",			/* 329 = __set_tcb */
+ 	"__get_tcb",			/* 330 = __get_tcb */
++	"recvmmsg",			/* 331 = recvmmsg */
++	"sendmmsg",			/* 332 = sendmmsg */
+ };
+Index: sys/kern/syscalls.master
+===================================================================
+RCS file: /cvs/src/sys/kern/syscalls.master,v
+retrieving revision 1.218
+diff -u -p -r1.218 syscalls.master
+--- sys/kern/syscalls.master	4 Jun 2021 09:05:19 -0000	1.218
++++ sys/kern/syscalls.master	23 Oct 2021 11:40:42 -0000
+@@ -566,3 +566,9 @@
+ 328	OBSOL		__tfork51
+ 329	STD NOLOCK	{ void sys___set_tcb(void *tcb); }
+ 330	STD NOLOCK	{ void *sys___get_tcb(void); }
++331	STD NOLOCK	{ int sys_recvmmsg(int s, struct mmsghdr *mmsg, \
++			    unsigned int vlen, int flags, \
++			    struct timespec *timeout); }
++332	STD NOLOCK	{ int sys_sendmmsg(int s,  \
++			    const struct mmsghdr *mmsg, unsigned int vlen, \
++			    int flags); }
+Index: sys/kern/uipc_syscalls.c
+===================================================================
+RCS file: /cvs/src/sys/kern/uipc_syscalls.c,v
+retrieving revision 1.194
+diff -u -p -r1.194 uipc_syscalls.c
+--- sys/kern/uipc_syscalls.c	24 Oct 2021 00:02:25 -0000	1.194
++++ sys/kern/uipc_syscalls.c	26 Oct 2021 18:04:41 -0000
+@@ -565,6 +565,72 @@ done:
+ }
+ 
+ int
++sys_sendmmsg(struct proc *p, void *v, register_t *retval)
++{
++	struct sys_sendmmsg_args /* {
++		syscallarg(int)			s;
++		syscallarg(struct mmsghdr *)	mmsg;
++		syscallarg(unsigned int)	vlen;
++		syscallarg(int)			flags;
++	} */ *uap = v;
++	struct mmsghdr mmsg;
++	struct iovec aiov[UIO_SMALLIOV], *iov;
++	struct msghdr *msg = &mmsg.msg_hdr;
++	unsigned int vlen, dg;
++	int error;
++
++	vlen = SCARG(uap, vlen);
++	if (vlen > 1024)
++		vlen = 1024;
++
++	for (dg = 0; dg < vlen; dg++) {
++		error = copyin(SCARG(uap, mmsg) + dg, &mmsg, sizeof(mmsg));
++		if (error)
++			break;
++#ifdef KTRACE
++		if (KTRPOINT(p, KTR_STRUCT))
++			ktrmsghdr(p, &msg);
++#endif
++
++
++		if (msg->msg_iovlen > IOV_MAX)
++			return (EMSGSIZE);
++		if (msg->msg_iovlen > UIO_SMALLIOV)
++			iov = mallocarray(msg->msg_iovlen, sizeof(struct iovec),
++			    M_IOV, M_WAITOK);
++		else
++			iov = aiov;
++		if (msg->msg_iovlen != 0 &&
++		    (error = copyin(msg->msg_iov, iov,
++			    msg->msg_iovlen * sizeof (struct iovec))))
++			break;
++#ifdef KTRACE
++		if (msg.msg_iovlen && KTRPOINT(p, KTR_STRUCT))
++			ktriovec(p, iov, msg.msg_iovlen);
++#endif
++
++		msg->msg_iov = iov;
++		msg->msg_flags = 0;
++
++		error = sendit(p, SCARG(uap, s), msg, SCARG(uap, flags),
++		    retval);
++		if (error)
++			break;
++
++		mmsg.msg_len = *retval;
++		error = copyout(&mmsg, SCARG(uap, mmsg) + dg, sizeof(mmsg));
++		if (error)
++			break;
++	}
++
++	*retval = dg;
++
++	if (dg)
++		return 0;
++	return error;
++}
++
++int
+ sendit(struct proc *p, int s, struct msghdr *mp, int flags, register_t *retsize)
+ {
+ 	struct file *fp;
+@@ -761,6 +827,127 @@ done:
+ 	if (iov != aiov)
+ 		free(iov, M_IOV, sizeof(struct iovec) * msg.msg_iovlen);
+ 	return (error);
++}
++
++int
++sys_recvmmsg(struct proc *p, void *v, register_t *retval)
++{
++	struct sys_recvmmsg_args /* {
++		syscallarg(int)			s;
++		syscallarg(struct mmsghdr *)	mmsg;
++		syscallarg(unsigned int)	vlen;
++		syscallarg(int)			flags;
++		syscallarg(struct timespec *)	timeout;
++	} */ *uap = v;
++	struct mmsghdr mmsg;
++	struct timespec ts, now;
++	struct iovec aiov[UIO_SMALLIOV], *uiov, *iov;
++	struct msghdr *msg = &mmsg.msg_hdr;
++	struct timespec *timeout;
++	unsigned int vlen, dg;
++	int error, flags;
++
++	timeout = SCARG(uap, timeout);
++	if (timeout != NULL) {
++		error = copyin(SCARG(uap, timeout), &ts, sizeof(ts));
++		if (error != 0)
++			return error;
++		getnanotime(&now);
++		timespecadd(&now, &ts, &ts);
++	}
++
++	flags = SCARG(uap, flags);
++
++	vlen = SCARG(uap, vlen);
++	if (vlen > 1024)
++		vlen = 1024;
++
++	for (dg = 0; dg < vlen;) {
++		error = copyin(SCARG(uap, mmsg) + dg, &mmsg, sizeof(mmsg));
++		if (error != 0)
++			break;
++
++		if (msg->msg_iovlen > IOV_MAX) {
++			error = EMSGSIZE;
++			break;
++		}
++
++		if (msg->msg_iovlen > UIO_SMALLIOV)
++			iov = mallocarray(msg->msg_iovlen,
++			    sizeof(struct iovec), M_IOV, M_WAITOK);
++		else
++			iov = aiov;
++
++		if (msg->msg_iovlen > 0) {
++			error = copyin(msg->msg_iov, iov,
++			    msg->msg_iovlen * sizeof(struct iovec));
++			if (error)
++				break;
++		}
++
++		uiov = msg->msg_iov;
++		msg->msg_iov = iov;
++		msg->msg_flags = flags;
++
++		error = recvit(p, SCARG(uap, s), msg, NULL, retval);
++		if (error != 0) {
++			if (error == EAGAIN && dg > 0)
++				error = 0;
++			break;
++		}
++
++		if (dg == 0 && flags & MSG_WAITFORONE) {
++			flags &= ~MSG_WAITFORONE;
++			flags |= MSG_DONTWAIT;
++		}
++
++		msg->msg_iov = uiov;
++		mmsg.msg_len = *retval;
++#ifdef KTRACE
++		if (KTRPOINT(p, KTR_STRUCT)) {
++			ktrmsghdr(p, &msg);
++			if (msg->msg_iovlen)
++				ktriovec(p, iov, msg->msg_iovlen);
++		}
++#endif
++
++		error = copyout(&mmsg, SCARG(uap, mmsg) + dg, sizeof(mmsg));
++		if (error != 0)
++			break;
++
++		if (iov != aiov) {
++			free(iov, M_IOV, sizeof(struct iovec) * msg->msg_iovlen);
++			iov = aiov;
++		}
++
++		dg++;
++		if (msg->msg_flags & MSG_OOB)
++			break;
++
++		if (timeout != NULL) {
++			getnanotime(&now);
++			timespecsub(&now, &ts, &now);
++			if (now.tv_sec > 0)
++				break;
++		}
++	}
++
++	*retval = dg;
++
++	/*
++	 * If we succeeded at least once, return 0, hopefully so->so_rerror
++	 * will catch it next time.
++	 */
++	if (error && dg > 0) {
++		//so->so_rerror = error;
++		error = 0;
++	}
++
++	if (iov != aiov) {
++		free(iov, M_IOV, sizeof(struct iovec) * msg->msg_iovlen);
++	}
++
++	return error;
+ }
+ 
+ int
+Index: sys/sys/socket.h
+===================================================================
+RCS file: /cvs/src/sys/sys/socket.h,v
+retrieving revision 1.100
+diff -u -p -r1.100 socket.h
+--- sys/sys/socket.h	17 May 2021 17:54:31 -0000	1.100
++++ sys/sys/socket.h	26 Oct 2021 17:56:53 -0000
+@@ -490,6 +490,11 @@ struct msghdr {
+ 	int		msg_flags;	/* flags on received message */
+ };
+ 
++struct mmsghdr {
++	struct msghdr msg_hdr;
++	unsigned int msg_len;
++};
++
+ #define	MSG_OOB			0x1	/* process out-of-band data */
+ #define	MSG_PEEK		0x2	/* peek at incoming message */
+ #define	MSG_DONTROUTE		0x4	/* send without using routing tables */
+@@ -502,6 +507,7 @@ struct msghdr {
+ #define	MSG_MCAST		0x200	/* this message rec'd as multicast */
+ #define	MSG_NOSIGNAL		0x400	/* do not send SIGPIPE */
+ #define	MSG_CMSG_CLOEXEC	0x800	/* set FD_CLOEXEC on received fds */
++#define MSG_WAITFORONE		0x1000	/* nonblocking but wait for one msg */
+ 
+ /*
+  * Header for ancillary data objects in msg_control buffer.
+@@ -574,6 +580,10 @@ int	shutdown(int, int);
+ int	sockatmark(int);
+ int	socket(int, int, int);
+ int	socketpair(int, int, int, int *);
++int	sendmmsg(int, struct mmsghdr *, unsigned int, int);
++struct timespec;
++int	recvmmsg(int, struct mmsghdr *, unsigned int, int,
++	    struct timespec *);
+ 
+ #if __BSD_VISIBLE
+ int	accept4(int, struct sockaddr *__restrict, socklen_t *__restrict, int);
+Index: sys/sys/syscall.h
+===================================================================
+RCS file: /cvs/src/sys/sys/syscall.h,v
+retrieving revision 1.227
+diff -u -p -r1.227 syscall.h
+--- sys/sys/syscall.h	4 Jun 2021 09:06:09 -0000	1.227
++++ sys/sys/syscall.h	23 Oct 2021 17:11:33 -0000
+@@ -1,4 +1,4 @@
+-/*	$OpenBSD: syscall.h,v 1.227 2021/06/04 09:06:09 mvs Exp $	*/
++/*	$OpenBSD$	*/
+ 
+ /*
+  * System call numbers.
+@@ -705,4 +705,10 @@
+ /* syscall: "__get_tcb" ret: "void *" args: */
+ #define	SYS___get_tcb	330
+ 
+-#define	SYS_MAXSYSCALL	331
++/* syscall: "recvmmsg" ret: "int" args: "int" "struct mmsghdr *" "unsigned int" "int" "struct timespec *" */
++#define	SYS_recvmmsg	331
++
++/* syscall: "sendmmsg" ret: "int" args: "int" "const struct mmsghdr *" "unsigned int" "int" */
++#define	SYS_sendmmsg	332
++
++#define	SYS_MAXSYSCALL	333
+Index: sys/sys/syscallargs.h
+===================================================================
+RCS file: /cvs/src/sys/sys/syscallargs.h,v
+retrieving revision 1.230
+diff -u -p -r1.230 syscallargs.h
+--- sys/sys/syscallargs.h	4 Jun 2021 09:06:09 -0000	1.230
++++ sys/sys/syscallargs.h	23 Oct 2021 17:11:33 -0000
+@@ -1,4 +1,4 @@
+-/*	$OpenBSD: syscallargs.h,v 1.230 2021/06/04 09:06:09 mvs Exp $	*/
++/*	$OpenBSD$	*/
+ 
+ /*
+  * System call argument lists.
+@@ -1109,6 +1109,21 @@ struct sys___set_tcb_args {
+ 	syscallarg(void *) tcb;
+ };
+ 
++struct sys_recvmmsg_args {
++	syscallarg(int) s;
++	syscallarg(struct mmsghdr *) mmsg;
++	syscallarg(unsigned int) vlen;
++	syscallarg(int) flags;
++	syscallarg(struct timespec *) timeout;
++};
++
++struct sys_sendmmsg_args {
++	syscallarg(int) s;
++	syscallarg(const struct mmsghdr *) mmsg;
++	syscallarg(unsigned int) vlen;
++	syscallarg(int) flags;
++};
++
+ /*
+  * System call prototypes.
+  */
+@@ -1360,3 +1375,5 @@ int	sys_symlinkat(struct proc *, void *,
+ int	sys_unlinkat(struct proc *, void *, register_t *);
+ int	sys___set_tcb(struct proc *, void *, register_t *);
+ int	sys___get_tcb(struct proc *, void *, register_t *);
++int	sys_recvmmsg(struct proc *, void *, register_t *);
++int	sys_sendmmsg(struct proc *, void *, register_t *);
+Index: lib/libc/Symbols.list
+===================================================================
+RCS file: /cvs/src/lib/libc/Symbols.list,v
+retrieving revision 1.74
+diff -u -p -r1.74 Symbols.list
+--- lib/libc/Symbols.list	3 Jun 2021 13:19:45 -0000	1.74
++++ lib/libc/Symbols.list	23 Oct 2021 21:41:17 -0000
+@@ -176,6 +176,7 @@ _thread_sys_readv
+ _thread_sys_reboot
+ _thread_sys_recvfrom
+ _thread_sys_recvmsg
++_thread_sys_recvmmsg
+ _thread_sys_rename
+ _thread_sys_renameat
+ _thread_sys_revoke
+@@ -185,6 +186,7 @@ _thread_sys_select
+ _thread_sys_semget
+ _thread_sys_semop
+ _thread_sys_sendmsg
++_thread_sys_sendmmsg
+ _thread_sys_sendsyslog
+ _thread_sys_sendto
+ _thread_sys_setegid
+@@ -373,6 +375,7 @@ readv
+ reboot
+ recvfrom
+ recvmsg
++recvmmsg
+ rename
+ renameat
+ revoke
+@@ -384,6 +387,7 @@ semctl
+ semget
+ semop
+ sendmsg
++sendmmsg
+ sendsyslog
+ sendto
+ setegid
+Index: lib/libc/shlib_version
+===================================================================
+RCS file: /cvs/src/lib/libc/shlib_version,v
+retrieving revision 1.210
+diff -u -p -r1.210 shlib_version
+--- lib/libc/shlib_version	2 Jun 2021 07:29:03 -0000	1.210
++++ lib/libc/shlib_version	25 Oct 2021 17:26:30 -0000
+@@ -1,4 +1,4 @@
+ major=96
+-minor=1
++minor=2
+ # note: If changes were made to include/thread_private.h or if system calls
+ # were added/changed then librthread/shlib_version must also be updated.
+Index: lib/libc/hidden/sys/socket.h
+===================================================================
+RCS file: /cvs/src/lib/libc/hidden/sys/socket.h,v
+retrieving revision 1.4
+diff -u -p -r1.4 socket.h
+--- lib/libc/hidden/sys/socket.h	7 May 2016 19:05:22 -0000	1.4
++++ lib/libc/hidden/sys/socket.h	25 Oct 2021 17:26:48 -0000
+@@ -33,8 +33,10 @@ PROTO_NORMAL(listen);
+ PROTO_NORMAL(recv);
+ PROTO_CANCEL(recvfrom);
+ PROTO_CANCEL(recvmsg);
++PROTO_CANCEL(recvmmsg);
+ PROTO_NORMAL(send);
+ PROTO_CANCEL(sendmsg);
++PROTO_CANCEL(sendmmsg);
+ PROTO_CANCEL(sendto);
+ PROTO_NORMAL(setrtable);
+ PROTO_NORMAL(setsockopt);
+Index: lib/libc/sys/Makefile.inc
+===================================================================
+RCS file: /cvs/src/lib/libc/sys/Makefile.inc,v
+retrieving revision 1.160
+diff -u -p -r1.160 Makefile.inc
+--- lib/libc/sys/Makefile.inc	11 Jun 2021 10:29:33 -0000	1.160
++++ lib/libc/sys/Makefile.inc	23 Oct 2021 17:20:52 -0000
+@@ -34,8 +34,8 @@ CANCEL=	accept accept4 \
+ 	nanosleep \
+ 	open openat \
+ 	poll ppoll pselect \
+-	read readv recvfrom recvmsg \
+-	select sendmsg sendto \
++	read readv recvfrom recvmsg recvmmsg \
++	select sendmsg sendmmsg sendto \
+ 	wait4 write writev
+ SRCS+=	${CANCEL:%=w_%.c} w_pread.c w_preadv.c w_pwrite.c w_pwritev.c
+ 
+Index: lib/libc/sys/recv.2
+===================================================================
+RCS file: /cvs/src/lib/libc/sys/recv.2,v
+retrieving revision 1.47
+diff -u -p -r1.47 recv.2
+--- lib/libc/sys/recv.2	11 Jan 2019 06:10:13 -0000	1.47
++++ lib/libc/sys/recv.2	26 Oct 2021 16:55:52 -0000
+@@ -46,15 +46,35 @@
+ .Fn recvfrom "int s" "void *buf" "size_t len" "int flags" "struct sockaddr *from" "socklen_t *fromlen"
+ .Ft ssize_t
+ .Fn recvmsg "int s" "struct msghdr *msg" "int flags"
++.Ft int
++.Fn recvmmsg "int s" "struct mmsghdr *mmsg" "unsigned int vlen" "int flags" "struct timespec *timeout"
+ .Sh DESCRIPTION
+-.Fn recvfrom
++.Fn recv ,
++.Fn recvfrom ,
++.Fn recvmsg ,
+ and
+-.Fn recvmsg
++.Fn recvmmsg
+ are used to receive messages from a socket,
+-.Fa s ,
+-and may be used to receive
++.Fa s .
++.Fn recv
++is normally used only on a
++.Em connected
++socket (see
++.Xr connect 2 ).
++.Fn recvfrom ,
++.Fn recvmsg ,
++and
++.Fn recvmmsg
++may be used to receive
+ data on a socket whether or not it is connection-oriented.
+ .Pp
++.Fn recv
++is identical to
++.Fn recvfrom
++with a null
++.Fa from
++parameter.
++.Pp
+ If
+ .Fa from
+ is non-null and the socket is not connection-oriented,
+@@ -66,20 +86,16 @@ the buffer associated with
+ and modified on return to indicate the actual size of the
+ address stored there.
+ .Pp
+-The
+-.Fn recv
+-call is normally used only on a
+-.Em connected
+-socket (see
+-.Xr connect 2 )
+-and is identical to
+-.Fn recvfrom
+-with a null
+-.Fa from
+-parameter.
+-.Pp
+-On successful completion, all three routines return the number of
+-message bytes read.
++On successful completion, 
++.Fn recv ,
++.Fn recvfrom ,
++and
++.Fn recvmsg
++return the number of
++message bytes read,
++.Fn recvmmsg
++returns the number
++of messages received.
+ If a message is too long to fit in the supplied
+ buffer, excess bytes may be discarded depending on the type of socket
+ the message is received from (see
+@@ -158,6 +174,8 @@ The
+ .Dv MSG_CMSG_CLOEXEC
+ requests that any file descriptors received as ancillary data with
+ .Fn recvmsg
++and
++.Fn recvmmsg
+ (see below)
+ have their close-on-exec flag set.
+ .Pp
+@@ -249,13 +267,29 @@ Indicates that the packet was received a
+ .It Dv MSG_MCAST
+ Indicates that the packet was received as multicast.
+ .El
++.Pp
++See
++.Xr send 2
++for a description of the
++.Fa mmsghdr
++structure.
+ .Sh RETURN VALUES
+-These calls return the number of bytes received, or \-1 if an error occurred.
++The
++.Fn send ,
++.Fn sendto ,
++and
++.Fn sendmsg
++calls return the number of bytes received, or \-1 if an error occurred.
++The
++.Fn sendmmsg
++call returns the number of messages received, or \-1
++if an error occurred before the first message has been received. 
+ .Sh ERRORS
+ .Fn recv ,
+ .Fn recvfrom ,
++.Fn recvmsg ,
+ and
+-.Fn recvmsg
++.Fn recvmmsg
+ fail if:
+ .Bl -tag -width "[EHOSTUNREACH]"
+ .It Bq Er EBADF
+@@ -310,6 +344,8 @@ was larger than
+ .Pp
+ And
+ .Fn recvmsg
++and
++.Fn recvmmsg
+ may return one of the following errors:
+ .Bl -tag -width Er
+ .It Bq Er EINVAL
+@@ -364,6 +400,12 @@ The
+ .Fn recv
+ function call appeared in
+ .Bx 4.1c .
++The
++.Fn sendmmsg
++syscall first appeared in Linux 2.6.33, was reimplemented for
++.Nx 7.0 ,
++and ported to
++.Ox 7.1 .
+ .Sh CAVEATS
+ Calling
+ .Fn recvmsg
+Index: lib/libc/sys/send.2
+===================================================================
+RCS file: /cvs/src/lib/libc/sys/send.2,v
+retrieving revision 1.34
+diff -u -p -r1.34 send.2
+--- lib/libc/sys/send.2	11 Jan 2019 06:10:13 -0000	1.34
++++ lib/libc/sys/send.2	26 Oct 2021 14:01:47 -0000
+@@ -36,7 +36,8 @@
+ .Sh NAME
+ .Nm send ,
+ .Nm sendto ,
+-.Nm sendmsg
++.Nm sendmsg ,
++.Nm sendmmsg
+ .Nd send a message from a socket
+ .Sh SYNOPSIS
+ .In sys/socket.h
+@@ -46,19 +47,23 @@
+ .Fn sendto "int s" "const void *msg" "size_t len" "int flags" "const struct sockaddr *to" "socklen_t tolen"
+ .Ft ssize_t
+ .Fn sendmsg "int s" "const struct msghdr *msg" "int flags"
++.Ft int
++.Fn sendmmsg "int s" "const struct mmsghdr *mmsg" "unsigned int vlen" "int flags"
+ .Sh DESCRIPTION
+ .Fn send ,
+ .Fn sendto ,
++.Fn sendmsg ,
+ and
+-.Fn sendmsg
++.Fn sendmmsg
+ are used to transmit a message to another socket.
+ .Fn send
+ may be used only when the socket is in a
+ .Em connected
+ state, while
+-.Fn sendto
++.Fn sendto ,
++.Fn sendmsg ,
+ and
+-.Fn sendmsg
++.Fn sendmmsg
+ may be used at any time.
+ .Pp
+ The address of the target is given by
+@@ -129,8 +134,17 @@ for a description of the
+ .Fa msghdr
+ structure.
+ .Sh RETURN VALUES
+-The call returns the number of characters sent, or \-1
++The
++.Fn send ,
++.Fn sendto ,
++and
++.Fn sendmsg
++calls return the number of characters sent, or \-1
+ if an error occurred.
++The
++.Fn sendmmsg
++call returns the number of messages sent, or \-1
++if an error occurred before the first message has been sent. 
+ .Sh ERRORS
+ .Fn send ,
+ .Fn sendto ,
+@@ -267,3 +281,9 @@ The
+ .Fn send
+ function call appeared in
+ .Bx 4.1c .
++The
++.Fn sendmmsg
++syscall first appeared in Linux 3.0, was reimplemented for
++.Nx 7.0 ,
++and ported to
++.Ox 7.1 .
+Index: lib/libc/sys/w_recvmmsg.c
+===================================================================
+RCS file: lib/libc/sys/w_recvmmsg.c
+diff -N lib/libc/sys/w_recvmmsg.c
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ lib/libc/sys/w_recvmmsg.c	23 Oct 2021 17:26:17 -0000
+@@ -0,0 +1,32 @@
++/*	$OpenBSD$ */
++/*
++ * Copyright (c) 2021 Moritz Buhl <mbuhl@openbsd.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <sys/socket.h>
++#include "cancel.h"
++
++int
++recvmmsg(int fd, struct mmsghdr *mmsg, unsigned int vlen, int flags,
++	    struct timespec *ts)
++{
++	ssize_t ret;
++
++	ENTER_CANCEL_POINT(1);
++	ret = HIDDEN(recvmmsg)(fd, mmsg, vlen, flags, ts);
++	LEAVE_CANCEL_POINT(ret == -1);
++	return (ret);
++}
++DEF_CANCEL(recvmmsg);
+Index: lib/libc/sys/w_sendmmsg.c
+===================================================================
+RCS file: lib/libc/sys/w_sendmmsg.c
+diff -N lib/libc/sys/w_sendmmsg.c
+--- /dev/null	1 Jan 1970 00:00:00 -0000
++++ lib/libc/sys/w_sendmmsg.c	23 Oct 2021 17:26:54 -0000
+@@ -0,0 +1,31 @@
++/*	$OpenBSD$ */
++/*
++ * Copyright (c) 2021 Moritz Buhl <mbuhl@openbsd.org>
++ *
++ * Permission to use, copy, modify, and distribute this software for any
++ * purpose with or without fee is hereby granted, provided that the above
++ * copyright notice and this permission notice appear in all copies.
++ *
++ * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
++ * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
++ * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
++ * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
++ * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
++ * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
++ * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
++ */
++
++#include <sys/socket.h>
++#include "cancel.h"
++
++int
++sendmmsg(int s, struct mmsghdr *mmsg, unsigned int vlen, int flags)
++{
++	ssize_t ret;
++
++	ENTER_CANCEL_POINT(1);
++	ret = HIDDEN(sendmmsg)(s, mmsg, vlen, flags);
++	LEAVE_CANCEL_POINT(ret <= 0);
++	return (ret);
++}
++DEF_CANCEL(sendmmsg);
